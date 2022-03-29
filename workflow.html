@@ -39,6 +39,8 @@ from logging import debug
 from io import BytesIO
 import urllib.parse
 import json
+from json import JSONEncoder
+from matplotlib import cm
 
 import requests as req
 import geopandas as gpd
@@ -218,10 +220,10 @@ class Workflow:
 
         return geo_json_with_time_to_geopandas(data)
 
-    def wms_get_map_as_image(self, bbox: QueryRectangle, colorizer_min_max: Tuple[float, float] = None) -&gt; Image:
+    def wms_get_map_as_image(self, bbox: QueryRectangle, colorizer: Colorizer = None) -&gt; Image:
         &#39;&#39;&#39;Return the result of a WMS request as a PIL Image&#39;&#39;&#39;
 
-        wms_request = self.__wms_get_map_request(bbox, colorizer_min_max)
+        wms_request = self.__wms_get_map_request(bbox, colorizer)
         response = req.Session().send(wms_request)
 
         check_response_for_error(response)
@@ -230,7 +232,7 @@ class Workflow:
 
     def __wms_get_map_request(self,
                               bbox: QueryRectangle,
-                              colorizer_min_max: Tuple[float, float] = None) -&gt; req.PreparedRequest:
+                              colorizer: Colorizer = None) -&gt; req.PreparedRequest:
         &#39;&#39;&#39;Return the WMS url for a workflow and a given `QueryRectangle`&#39;&#39;&#39;
 
         if not self.__result_descriptor.is_raster_result():
@@ -241,20 +243,10 @@ class Workflow:
         width = int((bbox.xmax - bbox.xmin) / bbox.resolution[0])
         height = int((bbox.ymax - bbox.ymin) / bbox.resolution[1])
 
-        colorizer = &#39;&#39;
-        if colorizer_min_max is not None:
-            colorizer = &#39;custom:&#39; + json.dumps({
-                &#34;type&#34;: &#34;linearGradient&#34;,
-                &#34;breakpoints&#34;: [{
-                    &#34;value&#34;: colorizer_min_max[0],
-                    &#34;color&#34;: [0, 0, 0, 255]
-                }, {
-                    &#34;value&#34;: colorizer_min_max[1],
-                    &#34;color&#34;: [255, 255, 255, 255]
-                }],
-                &#34;noDataColor&#34;: [0, 0, 0, 0],
-                &#34;defaultColor&#34;: [0, 0, 0, 0]
-            })
+        if colorizer is not None:
+            colorizer = colorizer.colorizer_get_url()
+        else:
+            colorizer = &#39;&#39;
 
         params = dict(
             service=&#39;WMS&#39;,
@@ -277,10 +269,10 @@ class Workflow:
             headers=session.auth_header
         ).prepare()
 
-    def wms_get_map_curl(self, bbox: QueryRectangle, colorizer_min_max: Tuple[float, float] = None) -&gt; str:
+    def wms_get_map_curl(self, bbox: QueryRectangle, colorizer: Colorizer = None) -&gt; str:
         &#39;&#39;&#39;Return the WMS curl command for a workflow and a given `QueryRectangle`&#39;&#39;&#39;
 
-        wms_request = self.__wms_get_map_request(bbox, colorizer_min_max)
+        wms_request = self.__wms_get_map_request(bbox, colorizer)
 
         command = &#34;curl -X {method} -H {headers} &#39;{uri}&#39;&#34;
         headers = [f&#39;&#34;{k}: {v}&#34;&#39; for k, v in wms_request.headers.items()]
@@ -466,7 +458,68 @@ def workflow_by_id(workflow_id: UUID) -&gt; Workflow:
 
     # TODO: check that workflow exists
 
-    return Workflow(WorkflowId(workflow_id))</code></pre>
+    return Workflow(WorkflowId(workflow_id))
+
+
+class Colorizer:
+    &#39;&#39;&#39;
+    Creates a colormap and returns its JSON string
+    &#39;&#39;&#39;
+
+    __colormap_name: str
+    __colorizer_min_max: Tuple[float, float]
+    __steps: int
+    __no_data_color: Tuple[float, float, float, float]
+
+    def __init__(self,
+                 colorizer_min_max: Tuple[float, float],
+                 colormap_name: str = &#34;viridis&#34;,
+                 steps: int = 16,
+                 no_data_color: Tuple[float, float, float, float] = (0, 0, 0, 0)) -&gt; None:
+        &#39;&#39;&#39;Initialize a new &#39;Colorizer&#39; object&#39;&#39;&#39;
+        self.__colorizer_min_max = colorizer_min_max
+        self.__colormap_name = colormap_name
+        self.__steps = steps
+        self.__no_data_color = no_data_color
+
+    def __repr__(self) -&gt; str:
+        return f&#39;Colorizer({self.__colorizer_min_max}, {self.__colormap_name}, {self.__steps}, {self.__no_data_color})&#39;
+
+    def __str__(self) -&gt; str:
+        return f&#39;Colorizer: min_max: {self.__colorizer_min_max}, colormap: {self.__colormap_name}, &#39; \
+            f&#39;steps: {self.__steps}, no_data_color: {self.__no_data_color}&#39;
+
+    def colorizer_get_url(self) -&gt; str:
+        &#39;&#39;&#39;
+        Returns url for custom colorizer
+        &#39;&#39;&#39;
+        cmap = cm.get_cmap(self.__colormap_name, 256)
+        gradient = cmap(np.linspace(0, 1, self.__steps))
+        vals = np.linspace(self.__colorizer_min_max[0], self.__colorizer_min_max[1], self.__steps)
+
+        colors = []
+        for enum in enumerate(gradient):
+            color = {&#34;value&#34;: vals[enum[0]], &#34;color&#34;: np.round((gradient[enum[0]] * 255), 2).astype(np.uint8)}
+            colors.append(color)
+
+        colorizer = &#39;&#39;
+        colorizer = &#39;custom:&#39; + json.dumps({
+            &#34;type&#34;: &#34;linearGradient&#34;,
+            &#34;breakpoints&#34;: colors,
+            &#34;noDataColor&#34;: self.__no_data_color,
+            &#34;defaultColor&#34;: (255, 255, 255, 255),
+        }, cls=NumpyArrayEncoder)
+        return colorizer
+
+
+class NumpyArrayEncoder(JSONEncoder):
+    &#39;&#39;&#39;
+    Numpy Array Encoder for JSON
+    &#39;&#39;&#39;
+    def default(self, o):
+        if isinstance(o, np.ndarray):
+            return o.tolist()
+        return JSONEncoder.default(self, o)</code></pre>
 </details>
 </section>
 <section>
@@ -525,6 +578,195 @@ def workflow_by_id(workflow_id: UUID) -&gt; Workflow:
 <section>
 <h2 class="section-title" id="header-classes">Classes</h2>
 <dl>
+<dt id="geoengine.workflow.Colorizer"><code class="flex name class">
+<span>class <span class="ident">Colorizer</span></span>
+<span>(</span><span>colorizer_min_max: Tuple[float, float], colormap_name: str = 'viridis', steps: int = 16, no_data_color: Tuple[float, float, float, float] = (0, 0, 0, 0))</span>
+</code></dt>
+<dd>
+<div class="desc"><p>Creates a colormap and returns its JSON string</p>
+<p>Initialize a new 'Colorizer' object</p></div>
+<details class="source">
+<summary>
+<span>Expand source code</span>
+</summary>
+<pre><code class="python">class Colorizer:
+    &#39;&#39;&#39;
+    Creates a colormap and returns its JSON string
+    &#39;&#39;&#39;
+
+    __colormap_name: str
+    __colorizer_min_max: Tuple[float, float]
+    __steps: int
+    __no_data_color: Tuple[float, float, float, float]
+
+    def __init__(self,
+                 colorizer_min_max: Tuple[float, float],
+                 colormap_name: str = &#34;viridis&#34;,
+                 steps: int = 16,
+                 no_data_color: Tuple[float, float, float, float] = (0, 0, 0, 0)) -&gt; None:
+        &#39;&#39;&#39;Initialize a new &#39;Colorizer&#39; object&#39;&#39;&#39;
+        self.__colorizer_min_max = colorizer_min_max
+        self.__colormap_name = colormap_name
+        self.__steps = steps
+        self.__no_data_color = no_data_color
+
+    def __repr__(self) -&gt; str:
+        return f&#39;Colorizer({self.__colorizer_min_max}, {self.__colormap_name}, {self.__steps}, {self.__no_data_color})&#39;
+
+    def __str__(self) -&gt; str:
+        return f&#39;Colorizer: min_max: {self.__colorizer_min_max}, colormap: {self.__colormap_name}, &#39; \
+            f&#39;steps: {self.__steps}, no_data_color: {self.__no_data_color}&#39;
+
+    def colorizer_get_url(self) -&gt; str:
+        &#39;&#39;&#39;
+        Returns url for custom colorizer
+        &#39;&#39;&#39;
+        cmap = cm.get_cmap(self.__colormap_name, 256)
+        gradient = cmap(np.linspace(0, 1, self.__steps))
+        vals = np.linspace(self.__colorizer_min_max[0], self.__colorizer_min_max[1], self.__steps)
+
+        colors = []
+        for enum in enumerate(gradient):
+            color = {&#34;value&#34;: vals[enum[0]], &#34;color&#34;: np.round((gradient[enum[0]] * 255), 2).astype(np.uint8)}
+            colors.append(color)
+
+        colorizer = &#39;&#39;
+        colorizer = &#39;custom:&#39; + json.dumps({
+            &#34;type&#34;: &#34;linearGradient&#34;,
+            &#34;breakpoints&#34;: colors,
+            &#34;noDataColor&#34;: self.__no_data_color,
+            &#34;defaultColor&#34;: (255, 255, 255, 255),
+        }, cls=NumpyArrayEncoder)
+        return colorizer</code></pre>
+</details>
+<h3>Methods</h3>
+<dl>
+<dt id="geoengine.workflow.Colorizer.colorizer_get_url"><code class="name flex">
+<span>def <span class="ident">colorizer_get_url</span></span>(<span>self) ‑> str</span>
+</code></dt>
+<dd>
+<div class="desc"><p>Returns url for custom colorizer</p></div>
+<details class="source">
+<summary>
+<span>Expand source code</span>
+</summary>
+<pre><code class="python">def colorizer_get_url(self) -&gt; str:
+    &#39;&#39;&#39;
+    Returns url for custom colorizer
+    &#39;&#39;&#39;
+    cmap = cm.get_cmap(self.__colormap_name, 256)
+    gradient = cmap(np.linspace(0, 1, self.__steps))
+    vals = np.linspace(self.__colorizer_min_max[0], self.__colorizer_min_max[1], self.__steps)
+
+    colors = []
+    for enum in enumerate(gradient):
+        color = {&#34;value&#34;: vals[enum[0]], &#34;color&#34;: np.round((gradient[enum[0]] * 255), 2).astype(np.uint8)}
+        colors.append(color)
+
+    colorizer = &#39;&#39;
+    colorizer = &#39;custom:&#39; + json.dumps({
+        &#34;type&#34;: &#34;linearGradient&#34;,
+        &#34;breakpoints&#34;: colors,
+        &#34;noDataColor&#34;: self.__no_data_color,
+        &#34;defaultColor&#34;: (255, 255, 255, 255),
+    }, cls=NumpyArrayEncoder)
+    return colorizer</code></pre>
+</details>
+</dd>
+</dl>
+</dd>
+<dt id="geoengine.workflow.NumpyArrayEncoder"><code class="flex name class">
+<span>class <span class="ident">NumpyArrayEncoder</span></span>
+<span>(</span><span>*, skipkeys=False, ensure_ascii=True, check_circular=True, allow_nan=True, sort_keys=False, indent=None, separators=None, default=None)</span>
+</code></dt>
+<dd>
+<div class="desc"><p>Numpy Array Encoder for JSON</p>
+<p>Constructor for JSONEncoder, with sensible defaults.</p>
+<p>If skipkeys is false, then it is a TypeError to attempt
+encoding of keys that are not str, int, float or None.
+If
+skipkeys is True, such items are simply skipped.</p>
+<p>If ensure_ascii is true, the output is guaranteed to be str
+objects with all incoming non-ASCII characters escaped.
+If
+ensure_ascii is false, the output can contain non-ASCII characters.</p>
+<p>If check_circular is true, then lists, dicts, and custom encoded
+objects will be checked for circular references during encoding to
+prevent an infinite recursion (which would cause an RecursionError).
+Otherwise, no such check takes place.</p>
+<p>If allow_nan is true, then NaN, Infinity, and -Infinity will be
+encoded as such.
+This behavior is not JSON specification compliant,
+but is consistent with most JavaScript based encoders and decoders.
+Otherwise, it will be a ValueError to encode such floats.</p>
+<p>If sort_keys is true, then the output of dictionaries will be
+sorted by key; this is useful for regression tests to ensure
+that JSON serializations can be compared on a day-to-day basis.</p>
+<p>If indent is a non-negative integer, then JSON array
+elements and object members will be pretty-printed with that
+indent level.
+An indent level of 0 will only insert newlines.
+None is the most compact representation.</p>
+<p>If specified, separators should be an (item_separator, key_separator)
+tuple.
+The default is (', ', ': ') if <em>indent</em> is <code>None</code> and
+(',', ': ') otherwise.
+To get the most compact JSON representation,
+you should specify (',', ':') to eliminate whitespace.</p>
+<p>If specified, default is a function that gets called for objects
+that can't otherwise be serialized.
+It should return a JSON encodable
+version of the object or raise a <code>TypeError</code>.</p></div>
+<details class="source">
+<summary>
+<span>Expand source code</span>
+</summary>
+<pre><code class="python">class NumpyArrayEncoder(JSONEncoder):
+    &#39;&#39;&#39;
+    Numpy Array Encoder for JSON
+    &#39;&#39;&#39;
+    def default(self, o):
+        if isinstance(o, np.ndarray):
+            return o.tolist()
+        return JSONEncoder.default(self, o)</code></pre>
+</details>
+<h3>Ancestors</h3>
+<ul class="hlist">
+<li>json.encoder.JSONEncoder</li>
+</ul>
+<h3>Methods</h3>
+<dl>
+<dt id="geoengine.workflow.NumpyArrayEncoder.default"><code class="name flex">
+<span>def <span class="ident">default</span></span>(<span>self, o)</span>
+</code></dt>
+<dd>
+<div class="desc"><p>Implement this method in a subclass such that it returns
+a serializable object for <code>o</code>, or calls the base implementation
+(to raise a <code>TypeError</code>).</p>
+<p>For example, to support arbitrary iterators, you could
+implement default like this::</p>
+<pre><code>def default(self, o):
+    try:
+        iterable = iter(o)
+    except TypeError:
+        pass
+    else:
+        return list(iterable)
+    # Let the base class default method raise the TypeError
+    return JSONEncoder.default(self, o)
+</code></pre></div>
+<details class="source">
+<summary>
+<span>Expand source code</span>
+</summary>
+<pre><code class="python">def default(self, o):
+    if isinstance(o, np.ndarray):
+        return o.tolist()
+    return JSONEncoder.default(self, o)</code></pre>
+</details>
+</dd>
+</dl>
+</dd>
 <dt id="geoengine.workflow.Workflow"><code class="flex name class">
 <span>class <span class="ident">Workflow</span></span>
 <span>(</span><span>workflow_id: <a title="geoengine.workflow.WorkflowId" href="#geoengine.workflow.WorkflowId">WorkflowId</a>)</span>
@@ -669,10 +911,10 @@ def workflow_by_id(workflow_id: UUID) -&gt; Workflow:
 
         return geo_json_with_time_to_geopandas(data)
 
-    def wms_get_map_as_image(self, bbox: QueryRectangle, colorizer_min_max: Tuple[float, float] = None) -&gt; Image:
+    def wms_get_map_as_image(self, bbox: QueryRectangle, colorizer: Colorizer = None) -&gt; Image:
         &#39;&#39;&#39;Return the result of a WMS request as a PIL Image&#39;&#39;&#39;
 
-        wms_request = self.__wms_get_map_request(bbox, colorizer_min_max)
+        wms_request = self.__wms_get_map_request(bbox, colorizer)
         response = req.Session().send(wms_request)
 
         check_response_for_error(response)
@@ -681,7 +923,7 @@ def workflow_by_id(workflow_id: UUID) -&gt; Workflow:
 
     def __wms_get_map_request(self,
                               bbox: QueryRectangle,
-                              colorizer_min_max: Tuple[float, float] = None) -&gt; req.PreparedRequest:
+                              colorizer: Colorizer = None) -&gt; req.PreparedRequest:
         &#39;&#39;&#39;Return the WMS url for a workflow and a given `QueryRectangle`&#39;&#39;&#39;
 
         if not self.__result_descriptor.is_raster_result():
@@ -692,20 +934,10 @@ def workflow_by_id(workflow_id: UUID) -&gt; Workflow:
         width = int((bbox.xmax - bbox.xmin) / bbox.resolution[0])
         height = int((bbox.ymax - bbox.ymin) / bbox.resolution[1])
 
-        colorizer = &#39;&#39;
-        if colorizer_min_max is not None:
-            colorizer = &#39;custom:&#39; + json.dumps({
-                &#34;type&#34;: &#34;linearGradient&#34;,
-                &#34;breakpoints&#34;: [{
-                    &#34;value&#34;: colorizer_min_max[0],
-                    &#34;color&#34;: [0, 0, 0, 255]
-                }, {
-                    &#34;value&#34;: colorizer_min_max[1],
-                    &#34;color&#34;: [255, 255, 255, 255]
-                }],
-                &#34;noDataColor&#34;: [0, 0, 0, 0],
-                &#34;defaultColor&#34;: [0, 0, 0, 0]
-            })
+        if colorizer is not None:
+            colorizer = colorizer.colorizer_get_url()
+        else:
+            colorizer = &#39;&#39;
 
         params = dict(
             service=&#39;WMS&#39;,
@@ -728,10 +960,10 @@ def workflow_by_id(workflow_id: UUID) -&gt; Workflow:
             headers=session.auth_header
         ).prepare()
 
-    def wms_get_map_curl(self, bbox: QueryRectangle, colorizer_min_max: Tuple[float, float] = None) -&gt; str:
+    def wms_get_map_curl(self, bbox: QueryRectangle, colorizer: Colorizer = None) -&gt; str:
         &#39;&#39;&#39;Return the WMS curl command for a workflow and a given `QueryRectangle`&#39;&#39;&#39;
 
-        wms_request = self.__wms_get_map_request(bbox, colorizer_min_max)
+        wms_request = self.__wms_get_map_request(bbox, colorizer)
 
         command = &#34;curl -X {method} -H {headers} &#39;{uri}&#39;&#34;
         headers = [f&#39;&#34;{k}: {v}&#34;&#39; for k, v in wms_request.headers.items()]
@@ -1165,7 +1397,7 @@ def workflow_by_id(workflow_id: UUID) -&gt; Workflow:
 </details>
 </dd>
 <dt id="geoengine.workflow.Workflow.wms_get_map_as_image"><code class="name flex">
-<span>def <span class="ident">wms_get_map_as_image</span></span>(<span>self, bbox: QueryRectangle, colorizer_min_max: Tuple[float, float] = None) ‑> Image</span>
+<span>def <span class="ident">wms_get_map_as_image</span></span>(<span>self, bbox: QueryRectangle, colorizer: <a title="geoengine.workflow.Colorizer" href="#geoengine.workflow.Colorizer">Colorizer</a> = None) ‑> Image</span>
 </code></dt>
 <dd>
 <div class="desc"><p>Return the result of a WMS request as a PIL Image</p></div>
@@ -1173,10 +1405,10 @@ def workflow_by_id(workflow_id: UUID) -&gt; Workflow:
 <summary>
 <span>Expand source code</span>
 </summary>
-<pre><code class="python">def wms_get_map_as_image(self, bbox: QueryRectangle, colorizer_min_max: Tuple[float, float] = None) -&gt; Image:
+<pre><code class="python">def wms_get_map_as_image(self, bbox: QueryRectangle, colorizer: Colorizer = None) -&gt; Image:
     &#39;&#39;&#39;Return the result of a WMS request as a PIL Image&#39;&#39;&#39;
 
-    wms_request = self.__wms_get_map_request(bbox, colorizer_min_max)
+    wms_request = self.__wms_get_map_request(bbox, colorizer)
     response = req.Session().send(wms_request)
 
     check_response_for_error(response)
@@ -1185,7 +1417,7 @@ def workflow_by_id(workflow_id: UUID) -&gt; Workflow:
 </details>
 </dd>
 <dt id="geoengine.workflow.Workflow.wms_get_map_curl"><code class="name flex">
-<span>def <span class="ident">wms_get_map_curl</span></span>(<span>self, bbox: QueryRectangle, colorizer_min_max: Tuple[float, float] = None) ‑> str</span>
+<span>def <span class="ident">wms_get_map_curl</span></span>(<span>self, bbox: QueryRectangle, colorizer: <a title="geoengine.workflow.Colorizer" href="#geoengine.workflow.Colorizer">Colorizer</a> = None) ‑> str</span>
 </code></dt>
 <dd>
 <div class="desc"><p>Return the WMS curl command for a workflow and a given <code>QueryRectangle</code></p></div>
@@ -1193,10 +1425,10 @@ def workflow_by_id(workflow_id: UUID) -&gt; Workflow:
 <summary>
 <span>Expand source code</span>
 </summary>
-<pre><code class="python">def wms_get_map_curl(self, bbox: QueryRectangle, colorizer_min_max: Tuple[float, float] = None) -&gt; str:
+<pre><code class="python">def wms_get_map_curl(self, bbox: QueryRectangle, colorizer: Colorizer = None) -&gt; str:
     &#39;&#39;&#39;Return the WMS curl command for a workflow and a given `QueryRectangle`&#39;&#39;&#39;
 
-    wms_request = self.__wms_get_map_request(bbox, colorizer_min_max)
+    wms_request = self.__wms_get_map_request(bbox, colorizer)
 
     command = &#34;curl -X {method} -H {headers} &#39;{uri}&#39;&#34;
     headers = [f&#39;&#34;{k}: {v}&#34;&#39; for k, v in wms_request.headers.items()]
@@ -1310,6 +1542,18 @@ def from_response(cls, response: Dict[str, str]) -&gt; WorkflowId:
 </li>
 <li><h3><a href="#header-classes">Classes</a></h3>
 <ul>
+<li>
+<h4><code><a title="geoengine.workflow.Colorizer" href="#geoengine.workflow.Colorizer">Colorizer</a></code></h4>
+<ul class="">
+<li><code><a title="geoengine.workflow.Colorizer.colorizer_get_url" href="#geoengine.workflow.Colorizer.colorizer_get_url">colorizer_get_url</a></code></li>
+</ul>
+</li>
+<li>
+<h4><code><a title="geoengine.workflow.NumpyArrayEncoder" href="#geoengine.workflow.NumpyArrayEncoder">NumpyArrayEncoder</a></code></h4>
+<ul class="">
+<li><code><a title="geoengine.workflow.NumpyArrayEncoder.default" href="#geoengine.workflow.NumpyArrayEncoder.default">default</a></code></li>
+</ul>
+</li>
 <li>
 <h4><code><a title="geoengine.workflow.Workflow" href="#geoengine.workflow.Workflow">Workflow</a></code></h4>
 <ul class="">
